@@ -6,9 +6,10 @@ ESP32-based GPS fleet tracking firmware using **SIM808** (GPRS + GPS) and **MQTT
 ## Overview
 
 This Arduino project runs on an **ESP32** and:
-- Reads GPS coordinates from a **SIM808** module via UART
+- Reads GPS coordinates from a **SIM808** module using AT commands
 - Connects to the internet via **GPRS** (Ooredoo TN APN)
-- Publishes real-time location data to an **MQTT broker** every 5 seconds
+- Publishes real-time location data to an **MQTT broker** every 15 seconds
+- Uses a single UART connection for both GSM and GPS communication
 
 ---
 
@@ -23,11 +24,11 @@ This Arduino project runs on an **ESP32** and:
 ### Wiring
 
 | ESP32 Pin | SIM808 |
-|-----------|--------|
-| GPIO 16 (RX2) | SIM800 TX |
-| GPIO 17 (TX2) | SIM800 RX |
-| GPIO 4 (RX1) | GPS TX |
-| GPIO 5 (TX1) | GPS RX |
+|-----------|---------|
+| GPIO 16 (RX2) | SIM808 TX |
+| GPIO 17 (TX2) | SIM808 RX |
+| GND | GND |
+| 4V External Supply | VCC |
 
 ---
 
@@ -42,12 +43,12 @@ Install these libraries via the **Arduino Library Manager**:
 
 ## Configuration
 
-Before flashing, update the following in `main.ino`:
+Before flashing, update the following in `sim808_gps_mqtt.ino`:
 
 ```cpp
 const char apn[] = "internet.ooredoo.tn";
 const char* mqttBroker = "broker.hivemq.com";
-const int   mqttPort   = 1883;
+const int mqttPort = 1883;
 ```
 
 > For production, move credentials to a `secrets.h` file and add it to `.gitignore`.
@@ -74,11 +75,12 @@ Data is published to: `fleet/<deviceId>/gps`
 }
 ```
 
+
 ---
 
 ## How to Flash
 
-1. Open `main.ino` in **Arduino IDE**
+1. Open `sim808_gps_mqtt.ino` in **Arduino IDE**
 2. Select board: `ESP32 Dev Module`
 3. Select the correct **COM port**
 4. Click **Upload**
