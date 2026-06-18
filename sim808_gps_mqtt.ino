@@ -4,15 +4,15 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 // SERIAL CONFIG
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 #define SerialMon Serial
-#define SerialAT  Serial2   // SIM808 -- single UART for BOTH GSM and GPS
+#define SerialAT  Serial2
 
-// -------------------------------------------------
-// SIM808 (MQTT + GPRS + GPS -- all on Serial2)
-// -------------------------------------------------
+// ─────────────────────────────────────────────
+// SIM808 — GPRS + GPS + MQTT on Serial2
+// ─────────────────────────────────────────────
 const char apn[]      = "internet.ooredoo.tn";
 const char gprsUser[] = "";
 const char gprsPass[] = "";
@@ -24,44 +24,38 @@ TinyGsm       modem(SerialAT);
 TinyGsmClient gsmClient(modem);
 PubSubClient  mqtt(gsmClient);
 
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 // DEVICE
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 String deviceId;
 String mqttTopic;
 
-unsigned long lastPublish = 0;
-const unsigned long PUBLISH_INTERVAL = 15000; // 15s -- give GPS time between polls
+unsigned long lastPublish    = 0;
+const unsigned long PUBLISH_INTERVAL = 15000;
 
-// -------------------------------------------------
-// AT HELPER -- uses SerialAT directly (bypasses TinyGSM)
-// -------------------------------------------------
+// ─────────────────────────────────────────────
+// AT HELPER
+// ─────────────────────────────────────────────
 String sendATDirect(String cmd, int timeout = 2000) {
   while (SerialAT.available()) SerialAT.read();
-
   SerialAT.println(cmd);
 
-  String resp = "";
-  long start = millis();
+  String resp  = "";
+  long   start = millis();
   while (millis() - start < timeout) {
-    while (SerialAT.available()) {
-      resp += (char)SerialAT.read();
-    }
+    while (SerialAT.available()) resp += (char)SerialAT.read();
   }
 
   SerialMon.println(">> " + cmd);
   SerialMon.println(resp);
-
   return resp;
 }
 
-// -------------------------------------------------
-// CSV FIELD PARSER
-// -------------------------------------------------
+// ─────────────────────────────────────────────
+// CSV FIELD PARSER  (AT+CGNSINF / AT+CBC)
+// ─────────────────────────────────────────────
 String getField(String data, int n) {
-  int count = 0;
-  int start = 0;
-
+  int count = 0, start = 0;
   for (int i = 0; i <= (int)data.length(); i++) {
     if (i == (int)data.length() || data[i] == ',') {
       if (count == n) return data.substring(start, i);
@@ -72,14 +66,77 @@ String getField(String data, int n) {
   return "";
 }
 
-// -------------------------------------------------
-// GPS -- polls AT+CGNSINF, waits up to 5 min for fix
-// -------------------------------------------------
-bool getGPS(float &lat, float &lng, float &speed, float &altitude,
-            float &heading, int &satellites, float &hdop) {
+// ─────────────────────────────────────────────
+// DEVICE ID
+// ─────────────────────────────────────────────
+String getDeviceId() {
+  uint64_t chipid = ESP.getEfuseMac();
+  char id[20];
+  snprintf(id, sizeof(id),
+           "ESP32-%04X%08X",
+           (uint16_t)(chipid >> 32),
+           (uint32_t)(chipid));
+  return String(id);
+}
 
-  sendATDirect("AT+CGNSPWR=1", 2000);
-  delay(2000);
+// ─────────────────────────────────────────────
+// BATTERY — reads from SIM808 via AT+CBC
+// No GPIO/voltage divider needed
+// AT+CBC returns: +CBC: <status>,<percent>,<voltage_mV>
+// ─────────────────────────────────────────────
+float readBatteryPercent() {
+  String resp = sendATDirect("AT+CBC", 2000);
+
+  int idx = resp.indexOf("+CBC:");
+  if (idx == -1) {
+    SerialMon.println("Battery read failed");
+    return -1;  // backend ignores -1
+  }
+
+  String data = resp.substring(idx + 5);
+  data.trim();
+
+  // field 0 = charge status, field 1 = percent, field 2 = voltage mV
+  String spct = getField(data, 1);
+  float  pct  = spct.toFloat();
+
+  SerialMon.println("Battery: " + String(pct) + "%");
+  return constrain(pct, 0.0, 100.0);
+}
+
+// ─────────────────────────────────────────────
+// TIMESTAMP — real GSM network time
+// ─────────────────────────────────────────────
+String getTimestamp() {
+  String t = modem.getGSMDateTime(DATE_FULL);
+  if (t.length() > 0) return t;
+  return "unknown";
+}
+
+// ─────────────────────────────────────────────
+// GPS — polls AT+CGNSINF, waits up to 5 min for fix
+// Extracts real heading, satellites, hdop
+//
+// AT+CGNSINF field map:
+//  0  GNSS run status
+//  1  Fix status (1 = valid)
+//  2  UTC datetime
+//  3  Latitude
+//  4  Longitude
+//  5  Altitude (m)
+//  6  Speed (km/h)
+//  7  Course / heading (degrees)
+//  8  Fix mode
+//  9  Reserved
+//  10 HDOP
+//  11 PDOP
+//  12 VDOP
+//  13 Reserved
+//  14 Satellites in view
+// ─────────────────────────────────────────────
+bool getGPS(float &lat, float &lng, float &speed,
+            float &altitude, float &heading,
+            int &satellites, float &hdop) {
 
   for (int attempt = 0; attempt < 60; attempt++) {
 
@@ -95,26 +152,31 @@ bool getGPS(float &lat, float &lng, float &speed, float &altitude,
     String data = resp.substring(idx + 9);
     data.trim();
 
-    String fix        = getField(data, 1);
-    String slat       = getField(data, 3);
-    String slng       = getField(data, 4);
-    String salt       = getField(data, 5);
-    String sspeed     = getField(data, 6);
-    String sheading   = getField(data, 7);
-    String shdop      = getField(data, 10);
-    String ssatellites = getField(data, 14);
+    String fix     = getField(data, 1);
+    String slat    = getField(data, 3);
+    String slng    = getField(data, 4);
+    String salt    = getField(data, 5);
+    String sspeed  = getField(data, 6);
+    String scourse = getField(data, 7);
+    String shdop   = getField(data, 10);
+    String ssats   = getField(data, 14);
 
-    SerialMon.println("Fix status: " + fix + " | attempt " + String(attempt + 1) + "/60");
+    SerialMon.println("Fix: " + fix +
+                      " | Attempt " + String(attempt + 1) + "/60" +
+                      " | Sats: " + ssats);
 
     if (fix == "1" && slat.length() >= 3 && slng.length() >= 3) {
       lat        = slat.toFloat();
       lng        = slng.toFloat();
       altitude   = salt.toFloat();
       speed      = sspeed.toFloat();
-      heading    = sheading.toFloat();
+      heading    = scourse.toFloat();
       hdop       = shdop.toFloat();
-      satellites = ssatellites.toInt();
-      SerialMon.println("GPS Fix: " + slat + ", " + slng);
+      satellites = ssats.toInt();
+
+      SerialMon.println("GPS Fix: " + slat + ", " + slng +
+                        " @ " + sspeed + " km/h | HDG " + scourse +
+                        " | Sats " + ssats);
       return true;
     }
 
@@ -125,28 +187,24 @@ bool getGPS(float &lat, float &lng, float &speed, float &altitude,
   return false;
 }
 
-// -------------------------------------------------
-// DEVICE ID
-// -------------------------------------------------
-String getDeviceId() {
-  uint64_t chipid = ESP.getEfuseMac();
-  char id[20];
-  snprintf(id, sizeof(id),
-           "ESP32-%04X%08X",
-           (uint16_t)(chipid >> 32),
-           (uint32_t)(chipid));
-  return String(id);
-}
-
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 // GPRS CONNECT
-// -------------------------------------------------
+// restart() only on first connect — preserves GPS engine on reconnects
+// ─────────────────────────────────────────────
 void connectGPRS() {
   if (modem.isGprsConnected()) return;
 
   SerialMon.println("Connecting GPRS...");
-  modem.restart();
-  delay(3000);
+
+  modem.init();
+  delay(1000);
+
+  SerialMon.print("Waiting for network...");
+  if (!modem.waitForNetwork(60000L)) {
+    SerialMon.println(" Network timeout");
+    return;
+  }
+  SerialMon.println(" OK");
 
   if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
     SerialMon.println("GPRS FAILED");
@@ -155,9 +213,9 @@ void connectGPRS() {
   }
 }
 
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 // MQTT CONNECT
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 void connectMQTT() {
   mqtt.setServer(mqttBroker, mqttPort);
   mqtt.setBufferSize(512);
@@ -168,9 +226,9 @@ void connectMQTT() {
     String clientId = deviceId + "-" + String(random(0xffff), HEX);
 
     if (mqtt.connect(clientId.c_str())) {
-      SerialMon.println(" CONNECTED");
+      SerialMon.println("CONNECTED");
     } else {
-      SerialMon.print(" FAILED rc=");
+      SerialMon.print("FAILED rc=");
       SerialMon.println(mqtt.state());
       delay(3000);
       tries++;
@@ -178,67 +236,55 @@ void connectMQTT() {
   }
 }
 
-// -------------------------------------------------
-// TIMESTAMP -- reads from SIM808 modem clock
-// -------------------------------------------------
-String getTimestamp() {
-  String time = modem.getGSMDateTime(DATE_FULL);
-  if (time.length() == 0) return "1970-01-01T00:00:00Z";
-
-  // GSM format: "YY/MM/DD,HH:MM:SS+TZ"
-  // Output ISO 8601: "20YY-MM-DDTHH:MM:SSZ"
-  String year   = "20" + time.substring(0, 2);
-  String month  = time.substring(3, 5);
-  String day    = time.substring(6, 8);
-  String hour   = time.substring(9, 11);
-  String minute = time.substring(12, 14);
-  String second = time.substring(15, 17);
-
-  return year + "-" + month + "-" + day + "T" + hour + ":" + minute + ":" + second + "Z";
-}
-
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 // PUBLISH GPS
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 void publishGPS() {
   float lat, lng, speed, altitude, heading, hdop;
-  int satellites;
+  int   satellites;
 
   if (!getGPS(lat, lng, speed, altitude, heading, satellites, hdop)) {
-    SerialMon.println("Skipping publish -- no GPS fix");
+    SerialMon.println("Skipping publish — no GPS fix");
     return;
   }
 
-  StaticJsonDocument<300> doc;
+  float battery = readBatteryPercent();
+
+  StaticJsonDocument<400> doc;
   doc["deviceId"] = deviceId;
 
   JsonObject location = doc.createNestedObject("location");
   location["lat"] = lat;
   location["lng"] = lng;
 
-  doc["altitude"]   = altitude;
-  doc["speed"]      = speed;
-  doc["heading"]    = heading;
-  doc["satellites"] = satellites;
-  doc["hdop"]       = hdop;
-  doc["timestamp"]  = getTimestamp();
+  doc["altitude"]     = altitude;
+  doc["speed"]        = speed;
+  doc["heading"]      = heading;
+  doc["satellites"]   = satellites;
+  doc["hdop"]         = hdop;
+  doc["batteryLevel"] = battery;
+  // doc["deviceTimestamp"] = getTimestamp();
 
-  char payload[300];
+  char payload[400];
   serializeJson(doc, payload);
 
   SerialMon.println("Publishing:");
   SerialMon.println(payload);
 
-  bool ok = mqtt.publish(mqttTopic.c_str(), payload, true);
-  SerialMon.println(ok ? "Published" : "Publish failed");
+  // bool ok = mqtt.publish(mqttTopic.c_str(), payload, true);
+  // Publish GPS data to MQTT broker (false = do NOT retain message on broker)
+  bool ok = mqtt.publish(mqttTopic.c_str(), payload, false);
+  SerialMon.println(ok ? "Published OK" : "Publish FAILED");
 }
 
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 // SETUP
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 void setup() {
   SerialMon.begin(115200);
   SerialAT.begin(9600, SERIAL_8N1, 16, 17);
+
+  randomSeed(analogRead(0));
 
   deviceId  = getDeviceId();
   mqttTopic = "fleet/" + deviceId + "/gps";
@@ -248,11 +294,16 @@ void setup() {
 
   connectGPRS();
   connectMQTT();
+
+  // Power GPS engine once — stays warm between publishes
+  sendATDirect("AT+CGNSPWR=1", 2000);
+  delay(2000);
+  SerialMon.println("GPS engine powered on");
 }
 
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 // LOOP
-// -------------------------------------------------
+// ─────────────────────────────────────────────
 void loop() {
   if (!modem.isGprsConnected()) connectGPRS();
   if (!mqtt.connected())        connectMQTT();
